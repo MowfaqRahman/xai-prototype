@@ -14,16 +14,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from sklearn.preprocessing import FunctionTransformer
 
 # ------------------------------------------
-# 1️⃣ Define & Inject Custom Function
+# Define & Inject Custom Function
 # ------------------------------------------
 
 def log_income(X):
     X = X.copy()
     
-    # Check if X is a DataFrame and has the column
     if hasattr(X, "columns") and "person_income" in X.columns:
-        # FIX: Force the column to be a float. 
-        # DiCE sometimes generates 'object' dtype columns which breaks numpy math.
         X["person_income"] = np.log1p(X["person_income"].astype(float))
         
     return X
@@ -33,7 +30,7 @@ import __main__
 setattr(__main__, "log_income", log_income)
 
 # ------------------------------------------
-# 2️⃣ Initialize FastAPI App
+# Initialize FastAPI App
 # ------------------------------------------
 
 app = FastAPI(title="Loan Risk Assessment API")
@@ -47,7 +44,7 @@ app.add_middleware(
 )
 
 # ------------------------------------------
-# 3️⃣ Load Resources (Pipeline, SHAP, LIME)
+# Load Resources (Pipeline, SHAP, LIME)
 # ------------------------------------------
 
 pipeline = None
@@ -65,8 +62,7 @@ if os.path.exists(model_path):
     try:
         pipeline = joblib.load(model_path)
 
-        # 1. Initialize DiCE (Do this once at startup, near where you load SHAP/LIME)
-        # You need your training dataframe (untransformed) to initialize DiCE
+        # 1. Initialize DiCE
         train_df = pd.read_csv("loan_data.csv") # Or load from a saved pickle
 
         d = dice_ml.Data(
@@ -104,11 +100,11 @@ if os.path.exists(model_path):
 
         print(f"✅ Pipeline and SHAP loaded successfully!")
 
-        # 3. Initialize LIME (Needs transformed background data)
+        # 3. Initialize LIME
         if os.path.exists(background_data_path):
             X_train_transformed = joblib.load(background_data_path)
             
-            # Ensure dense format (LIME hates sparse matrices)
+            # Ensure dense format
             if hasattr(X_train_transformed, "toarray"):
                 X_train_transformed = X_train_transformed.toarray()
             elif isinstance(X_train_transformed, pd.DataFrame):
@@ -116,8 +112,8 @@ if os.path.exists(model_path):
 
             lime_explainer = lime.lime_tabular.LimeTabularExplainer(
                 training_data=X_train_transformed,
-                feature_names=feature_names if len(feature_names) > 0 else None,
-                class_names=['Approved', 'Rejected'], # 0 = Approved, 1 = Default/Rejected
+                feature_names=feature_names,
+                class_names=['Approved', 'Default'],
                 mode='classification'
             )
             print("✅ LIME Explainer loaded successfully!")
@@ -130,7 +126,7 @@ else:
     print(f"⚠️ Critical: Model file '{model_path}' not found.")
 
 # ------------------------------------------
-# 4️⃣ Define Input Schema
+# Define Input Schema
 # ------------------------------------------
 
 class LoanApplication(BaseModel):
@@ -149,7 +145,7 @@ class LoanApplication(BaseModel):
     previous_loan_defaults_on_file: str
 
 # ------------------------------------------
-# 5️⃣ Prediction Endpoint
+# Prediction Endpoint
 # ------------------------------------------
 
 @app.post("/predict")
@@ -161,98 +157,146 @@ async def predict(application: LoanApplication):
         input_data = application.dict()
         input_df = pd.DataFrame([input_data])
 
-        # --- 1. Predictions ---
+        # ------------------------------------------------
+        # 1️⃣ Prediction
+        # ------------------------------------------------
         prediction = pipeline.predict(input_df)[0]
-        probability = float(pipeline.predict_proba(input_df)[0][1])
 
-        # --- 2. Manual Preprocessing for Explainers ---
-        # Apply log income
+        # Class meaning:
+        # 0 = Approved
+        # 1 = Default / Rejected
+
+        prob_default = float(pipeline.predict_proba(input_df)[0][1])
+        prob_approval = float(pipeline.predict_proba(input_df)[0][0])
+
+        loan_status = "Rejected" if prediction == 1 else "Approved"
+
+        # Risk category based on default probability
+        if prob_default > 0.6:
+            risk_category = "High Risk"
+        elif prob_default > 0.3:
+            risk_category = "Moderate Risk"
+        else:
+            risk_category = "Low Risk"
+
+        # ------------------------------------------------
+        # 2️⃣ Preprocessing for Explainability
+        # ------------------------------------------------
         shap_data = log_income(input_df.copy())
-        
-        # Apply preprocessor
-        preprocessor = pipeline.named_steps.get("preprocessor") or pipeline.named_steps.get("columntransformer")
+
+        preprocessor = pipeline.named_steps.get("preprocessor") or \
+                       pipeline.named_steps.get("columntransformer")
+
         processed_data = preprocessor.transform(shap_data)
-        
-        # Convert sparse to dense if necessary
+
         if hasattr(processed_data, "toarray"):
             processed_data = processed_data.toarray()
         elif isinstance(processed_data, pd.DataFrame):
             processed_data = processed_data.values
 
-        # --- 3. SHAP Explanations ---
+        # ------------------------------------------------
+        # 3️⃣ SHAP Explanations
+        # ------------------------------------------------
         shap_values = shap_explainer.shap_values(processed_data)
-        shap_instance = shap_values[1][0] if isinstance(shap_values, list) else (shap_values[0, :, 1] if len(shap_values.shape) == 3 else shap_values[0])
+
+        # For tree models, shap_values[1] corresponds to class 1 (Default)
+        if isinstance(shap_values, list):
+            shap_instance = shap_values[1][0]  # Explain Default class
+        elif len(shap_values.shape) == 3:
+            shap_instance = shap_values[0, :, 1]
+        else:
+            shap_instance = shap_values[0]
 
         shap_factors = []
         for name, val in zip(feature_names, shap_instance):
             shap_factors.append({
                 "feature": name,
                 "impact_score": round(float(val), 4),
-                "impact_direction": "Increases Risk" if val > 0 else "Decreases Risk"
+                "impact_direction": (
+                    "Increases Default Risk" if val > 0 else "Supports Approval"
+                )
             })
+
         shap_factors.sort(key=lambda x: abs(x["impact_score"]), reverse=True)
 
-        # --- 4. LIME Explanations ---
+        # ------------------------------------------------
+        # 4️⃣ LIME Explanations
+        # ------------------------------------------------
         lime_factors = []
+
         if lime_explainer:
-            # LIME needs a 1D array for the instance
             instance_1d = processed_data[0]
-            
+
             exp = lime_explainer.explain_instance(
                 data_row=instance_1d,
-                predict_fn=model.predict_proba, # Pass the model's predict_proba, not the pipeline's
+                predict_fn=model.predict_proba,
                 num_features=3
             )
-            
+
             for rule, weight in exp.as_list():
                 lime_factors.append({
                     "rule": rule,
                     "weight": round(float(weight), 4),
-                    "impact": "Increases Risk" if weight > 0 else "Decreases Risk"
+                    "impact": (
+                        "Increases Default Risk" if weight > 0 else "Supports Approval"
+                    )
                 })
 
-        # --- 5. Risk Logic & Output ---
-        loan_status = "Rejected" if prediction == 1 else "Approved"
-        risk_category = "High Risk" if probability > 0.6 else ("Moderate Risk" if probability > 0.3 else "Low Risk")
-
+        # ------------------------------------------------
+        # 5️⃣ Counterfactuals (Only if Rejected)
+        # ------------------------------------------------
         counterfactuals = []
-        if prediction == 1: # 1 = Default/Rejected
+
+        if prediction == 1:  # Only if rejected
             try:
-                # Ask DiCE for 2 ways to get approved (0 = Approved)
-                # We restrict features_to_vary so it doesn't suggest changing age or gender
                 dice_exp = dice_explainer.generate_counterfactuals(
-                    input_df, 
-                    total_CFs=2, 
-                    desired_class=0,
-                    features_to_vary=['loan_amnt', 'person_income', 'credit_score'] 
+                    input_df,
+                    total_CFs=2,
+                    desired_class=0,  # Want approval
+                    features_to_vary=[
+                        'loan_amnt',
+                        'person_income',
+                        'credit_score'
+                    ]
                 )
-                
-                # Convert the DiCE output into a clean JSON format for the frontend
+
                 cf_df = dice_exp.cf_examples_list[0].final_cfs_df
-                
-                for index, row in cf_df.iterrows():
+
+                for _, row in cf_df.iterrows():
                     changes = []
-                    # Compare the counterfactual row to the original input
+
                     if row['loan_amnt'] < input_data['loan_amnt']:
-                        changes.append(f"Reduce loan amount to ${row['loan_amnt']:,.0f}")
+                        changes.append(
+                            f"Reduce loan amount to ${row['loan_amnt']:,.0f}"
+                        )
+
                     if row['person_income'] > input_data['person_income']:
-                        changes.append(f"Increase income to ${row['person_income']:,.0f}")
+                        changes.append(
+                            f"Increase income to ${row['person_income']:,.0f}"
+                        )
+
                     if row['credit_score'] > input_data['credit_score']:
-                        changes.append(f"Improve credit score to {row['credit_score']:.0f}")
-                    
+                        changes.append(
+                            f"Improve credit score to {row['credit_score']:.0f}"
+                        )
+
                     if changes:
                         counterfactuals.append(changes)
-                        
+
             except Exception as e:
                 print(f"DiCE Error: {e}")
 
+        # ------------------------------------------------
+        # 6️⃣ Final Response
+        # ------------------------------------------------
         return {
             "loan_status": loan_status,
             "risk_category": risk_category,
-            "probability_of_default": f"{probability:.2%}",
+            "probability_of_default": f"{prob_default:.2%}",
+            "probability_of_approval": f"{prob_approval:.2%}",
             "explanations": {
                 "shap_top_factors": shap_factors[:3],
-                "lime_rules": lime_factors if lime_factors else "LIME is disabled (missing background data)."
+                "lime_rules": lime_factors if lime_factors else "LIME is disabled."
             },
             "action_plan": counterfactuals
         }
@@ -260,7 +304,10 @@ async def predict(application: LoanApplication):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {str(e)}"
+        )
 
 if __name__ == "__main__":
     import uvicorn
